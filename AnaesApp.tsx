@@ -1848,14 +1848,15 @@ function PortfolioScreen({lists,patients,cases,setCases,cpd,setCpd,incidents,set
   );
 }
 
+
 // ══════════════════════════════════════════════════════════════════════════════
-// AI ASSISTANT SCREEN
+// AI ASSISTANT SCREEN — powered by Google Gemini (free, no backend needed)
 // ══════════════════════════════════════════════════════════════════════════════
 const AI_MODES = [
-  { id:"chat",    label:"Ask anything",     desc:"Clinical questions, guidelines, drug info",  color:"cyan"   },
-  { id:"drug_advice", label:"Drug advice",  desc:"Doses, interactions, pharmacology",          color:"purple" },
-  { id:"preop_summary", label:"Pre-op review", desc:"AI analysis of a patient's pre-op data", color:"blue"   },
-  { id:"handover_review", label:"Handover check", desc:"Review a handover note for gaps",      color:"green"  },
+  { id:"chat",           label:"Ask anything",   desc:"Clinical questions, guidelines, drug info", color:"cyan"   },
+  { id:"drug_advice",    label:"Drug advice",    desc:"Doses, interactions, pharmacology",          color:"purple" },
+  { id:"preop_summary",  label:"Pre-op review",  desc:"AI analysis of a patient's pre-op data",    color:"blue"   },
+  { id:"handover_review",label:"Handover check", desc:"Review a handover note for gaps",            color:"green"  },
 ];
 
 const QUICK_PROMPTS = {
@@ -1882,6 +1883,39 @@ const QUICK_PROMPTS = {
   ],
 };
 
+const SYSTEM_PROMPTS = {
+  chat: `You are an expert consultant anaesthetist assistant working in a UK NHS hospital (Oxford University Hospitals). You provide accurate, evidence-based clinical information following UK guidelines (RCoA, AAGBI, NICE, BNF). Always be concise and clinically relevant. Use UK drug names and spellings. Format responses clearly with headers where helpful. Always add a brief disclaimer reminding the user to apply their own clinical judgement.`,
+  drug_advice: `You are an expert consultant anaesthetist specialising in pharmacology. Provide accurate drug information using UK guidelines and BNF dosing. Always specify: dose, route, weight-based calculation where relevant, contraindications, and monitoring. Use UK drug names (e.g. adrenaline not epinephrine, paracetamol not acetaminophen). Flag any important interactions or cautions. Add a brief disclaimer to verify with current BNF/guidelines.`,
+  preop_summary: `You are a consultant anaesthetist performing a pre-operative assessment review. You will be given structured patient data. Provide a concise, clinically focused summary covering: 1. Key anaesthetic concerns and risk factors 2. Optimisation recommendations 3. Suggested anaesthetic technique considerations 4. Specific monitoring or precautions 5. Post-operative care considerations. Follow UK RCoA/AAGBI guidelines. Add a disclaimer that this is AI-assisted and clinical judgement must be applied.`,
+  handover_review: `You are a consultant anaesthetist reviewing a post-operative handover note. Identify any gaps, missing information, or concerns. Check for: airway management, fluid balance, analgesia plan, post-op targets, escalation plan, monitoring requirements, unresolved intraoperative issues. Be constructive and specific. Add a disclaimer that this is AI-assisted review only.`,
+};
+
+function buildPatientCtx(pt) {
+  if (!pt) return "";
+  const po = pt.preop || {}, io = pt.io || {};
+  return [
+    "═══ PATIENT CONTEXT ═══",
+    `Name: ${pt.name||"—"} | Age: ${pt.age||"—"}y | Sex: ${pt.sex==="M"?"Male":"Female"} | ASA: ${pt.asa||"—"}`,
+    `Procedure: ${pt.surgery||"—"} | Technique: ${pt.technique||"—"}`,
+    pt.weight ? `Weight: ${pt.weight}kg | Height: ${pt.height||"—"}cm` : "",
+    pt.allergies ? `⚠ ALLERGIES: ${pt.allergies}` : "Allergies: NKDA",
+    pt.medHistory ? `PMH: ${pt.medHistory}` : "",
+    pt.medications ? `Medications: ${pt.medications}` : "",
+    pt.airway ? `Airway: ${pt.airway}` : "",
+    po.hb ? `Hb: ${po.hb} g/dL | Plt: ${po.plt||"—"} | INR: ${po.inr||"—"} | Cr: ${po.creatinine||"—"} µmol/L | eGFR: ${po.egfr||"—"}` : "",
+    po.ecgResult ? `ECG: ${po.ecgResult}` : "",
+    po.echoFindings ? `Echo EF ${po.echoEF||"—"}%: ${po.echoFindings}` : "",
+    io.airwayType ? `Airway used: ${io.airwayType}${io.tubeSize?` ${io.tubeSize}mm`:""}${io.clGrade?` CL${io.clGrade}`:""}` : "",
+    io.crystVol ? `Fluids: ${io.crystType} ${io.crystVol}ml | EBL: ${io.ebl||"—"}ml | Urine: ${io.urine||"—"}ml` : "",
+    io.hbEnd ? `Hb end: ${io.hbEnd} g/dL` : "",
+    io.analgesia ? `Intraop analgesia: ${io.analgesia}` : "",
+    io.regional ? `Regional: ${io.regional}` : "",
+    io.regAnalgesia ? `Post-op regular: ${io.regAnalgesia}` : "",
+    io.rescAnalgesia ? `Rescue: ${io.rescAnalgesia}` : "",
+    "═══════════════════════",
+  ].filter(Boolean).join("\n");
+}
+
 function AiScreen({ patients, lists }) {
   const [mode, setMode] = useState("chat");
   const [input, setInput] = useState("");
@@ -1889,34 +1923,55 @@ function AiScreen({ patients, lists }) {
   const [messages, setMessages] = useState([]);
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
-  const bottomRef = useState(null);
-  const inputRef = useState(null);
+  const [apiKey, setApiKey] = useState(() => STORE.get("gemini-key") || "");
+  const [showKeySetup, setShowKeySetup] = useState(false);
+  const [keyInput, setKeyInput] = useState("");
+
   const modeInfo = AI_MODES.find(m => m.id === mode);
   const modeColor = C[modeInfo?.color || "cyan"];
-
   const selectedPatient = patients.find(p => p.id === selectedPatientId);
+
+  const saveKey = () => {
+    if (!keyInput.trim()) return;
+    STORE.set("gemini-key", keyInput.trim());
+    setApiKey(keyInput.trim());
+    setShowKeySetup(false);
+    setKeyInput("");
+  };
 
   const streamAI = async (prompt) => {
     if (!prompt.trim() || streaming) return;
+    if (!apiKey) { setShowKeySetup(true); return; }
+
     const userMsg = { role:"user", content: prompt, id: uid() };
     setMessages(prev => [...prev, userMsg]);
     setInput("");
     setStreaming(true);
     setStreamText("");
 
-    try {
-      const body = {
-        mode,
-        prompt,
-        ...(selectedPatient ? { patientContext: JSON.stringify(selectedPatient) } : {}),
-      };
-      const res = await fetch("/api/anaes-ai/assist", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
+    // Build full prompt with system + patient context
+    const system = SYSTEM_PROMPTS[mode] || SYSTEM_PROMPTS.chat;
+    const ctx = selectedPatient ? buildPatientCtx(selectedPatient) : "";
+    const fullPrompt = ctx ? `${ctx}\n\n${prompt}` : prompt;
 
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            system_instruction: { parts: [{ text: system }] },
+            contents: [{ role: "user", parts: [{ text: fullPrompt }] }],
+            generationConfig: { maxOutputTokens: 1024 },
+          }),
+        }
+      );
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err?.error?.message || `HTTP ${res.status}`);
+      }
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -1931,17 +1986,24 @@ function AiScreen({ patients, lists }) {
         buffer = parts.pop() || "";
         for (const part of parts) {
           if (!part.startsWith("data: ")) continue;
+          const jsonStr = part.slice(6).trim();
+          if (jsonStr === "[DONE]") break;
           try {
-            const obj = JSON.parse(part.slice(6));
-            if (obj.content) { full += obj.content; setStreamText(full); }
-            if (obj.done) break;
+            const obj = JSON.parse(jsonStr);
+            const text = obj?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (text) { full += text; setStreamText(full); }
           } catch {}
         }
       }
 
       setMessages(prev => [...prev, { role:"assistant", content: full, id: uid() }]);
     } catch (e) {
-      setMessages(prev => [...prev, { role:"assistant", content: "⚠️ Connection error — make sure the app is deployed or running with the API server.", id: uid() }]);
+      const msg = e.message || "Unknown error";
+      let friendly = `⚠️ Error: ${msg}`;
+      if (msg.includes("API_KEY_INVALID") || msg.includes("400")) {
+        friendly = "⚠️ Invalid API key. Tap the key icon to update it.";
+      }
+      setMessages(prev => [...prev, { role:"assistant", content: friendly, id: uid() }]);
     } finally {
       setStreaming(false);
       setStreamText("");
@@ -1952,21 +2014,59 @@ function AiScreen({ patients, lists }) {
 
   return (
     <div className="fu" style={{display:"flex",flexDirection:"column",height:"100%",padding:"0 16px"}}>
+
+      {/* Key setup modal */}
+      {showKeySetup && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.7)",zIndex:50,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div className="card" style={{width:"100%",maxWidth:380}}>
+            <div style={{fontSize:16,fontWeight:800,color:C.cyan,marginBottom:6}}>Set up free AI</div>
+            <div style={{fontSize:12,color:C.muted,marginBottom:14,lineHeight:1.5}}>
+              Get a free Google Gemini API key:<br/>
+              1. Go to <strong style={{color:C.cyan}}>aistudio.google.com</strong><br/>
+              2. Sign in with Google<br/>
+              3. Click <strong>Get API key → Create API key</strong><br/>
+              4. Copy and paste it below
+            </div>
+            <input
+              placeholder="Paste your AIza... key here"
+              value={keyInput}
+              onChange={e=>setKeyInput(e.target.value)}
+              style={{marginBottom:10,fontSize:13}}
+            />
+            <div style={{display:"flex",gap:8}}>
+              <button className="btn bc bsm" style={{flex:1,justifyContent:"center"}} onClick={saveKey}>Save Key</button>
+              <button className="btn bgh bsm" onClick={()=>setShowKeySetup(false)}>Cancel</button>
+            </div>
+            <div style={{fontSize:10,color:C.faint,marginTop:8}}>Key stored locally on your device only. Free tier: 1500 requests/day.</div>
+          </div>
+        </div>
+      )}
+
       <div style={{paddingTop:4,paddingBottom:12}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
           <div>
             <h2 style={{fontSize:20,fontWeight:800,fontFamily:"'Syne',sans-serif",color:modeColor}}>AI Assistant</h2>
-            <div style={{fontSize:12,color:C.muted}}>Powered by Claude · UK anaesthesia context</div>
+            <div style={{fontSize:12,color:C.muted}}>Gemini · UK anaesthesia context</div>
           </div>
-          {messages.length>0&&<button className="btn bgh bxs" onClick={clearChat}>Clear</button>}
+          <div style={{display:"flex",gap:6}}>
+            {messages.length>0&&<button className="btn bgh bxs" onClick={clearChat}>Clear</button>}
+            <button className="btn bgh bxs" onClick={()=>setShowKeySetup(true)} title="API key settings">🔑</button>
+          </div>
         </div>
+
+        {!apiKey && (
+          <div style={{background:C.amberDim,border:`1px solid ${C.amber}30`,borderRadius:12,padding:"10px 14px",marginBottom:10,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{fontSize:12,color:C.amber,fontWeight:600}}>Free AI key not set up yet</div>
+            <button className="btn bsm" style={{background:C.amber,color:"#060d1a",fontFamily:"'Syne',sans-serif"}} onClick={()=>setShowKeySetup(true)}>Set up free →</button>
+          </div>
+        )}
 
         <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:4,scrollbarWidth:"none",marginBottom:10}}>
           {AI_MODES.map(m=>(
             <button key={m.id} onClick={()=>setMode(m.id)} style={{
               flexShrink:0,padding:"7px 12px",border:`1px solid ${mode===m.id?C[m.color]:C.border}`,
               borderRadius:20,cursor:"pointer",background:mode===m.id?C[m.color]+"18":C.surface,
-              color:mode===m.id?C[m.color]:C.muted,fontFamily:"'Inter',system-ui,sans-serif",
+              color:mode===m.id?C[m.color]:C.muted,fontFamily:"'Syne',sans-serif",
               fontWeight:600,fontSize:12,transition:"all .15s",whiteSpace:"nowrap"
             }}>{m.label}</button>
           ))}
@@ -1978,58 +2078,60 @@ function AiScreen({ patients, lists }) {
             <select value={selectedPatientId} onChange={e=>setSelectedPatientId(e.target.value)} style={{fontSize:13}}>
               <option value="">— No patient selected —</option>
               {patients.map(p=>{
-                const list=lists.find(l=>l.id===p.listId);
-                return <option key={p.id} value={p.id}>{p.name}{list?` · ${list.theatre}`:""}</option>;
+                const list = lists.find(l=>l.id===p.listId);
+                return <option key={p.id} value={p.id}>{p.name}{list?` — ${list.theatre}`:""}</option>;
               })}
             </select>
           </div>
         )}
-      </div>
 
-      <div style={{flex:1,overflowY:"auto",paddingBottom:16}}>
-        {messages.length===0&&!streaming&&(
-          <div>
-            <div style={{fontSize:11,fontWeight:600,letterSpacing:"1px",textTransform:"uppercase",color:C.muted,marginBottom:8}}>Quick prompts</div>
-            {(QUICK_PROMPTS[mode]||[]).map((q,i)=>(
-              <button key={i} onClick={()=>streamAI(q)} style={{
-                display:"block",width:"100%",textAlign:"left",padding:"10px 14px",marginBottom:6,
-                border:`1px solid ${C.border}`,borderRadius:10,background:C.surface,
-                color:C.text,fontFamily:"'Inter',system-ui,sans-serif",fontSize:13,cursor:"pointer",
-                transition:"border-color .15s",lineHeight:1.4
-              }}
-              onMouseEnter={e=>e.currentTarget.style.borderColor=modeColor}
-              onMouseLeave={e=>e.currentTarget.style.borderColor=C.border}
-              >{q}</button>
+        {/* Quick prompts */}
+        {messages.length===0&&(
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            <div style={{fontSize:10,fontWeight:700,color:C.muted,letterSpacing:"0.8px",textTransform:"uppercase",marginBottom:2}}>Quick prompts</div>
+            {(QUICK_PROMPTS[mode]||[]).map(q=>(
+              <button key={q} onClick={()=>streamAI(q)} style={{
+                textAlign:"left",padding:"9px 12px",background:C.card,
+                border:`1px solid ${C.border}`,borderRadius:10,cursor:"pointer",
+                color:C.muted,fontSize:12,fontFamily:"'Syne',sans-serif",
+                transition:"all .15s",lineHeight:1.4
+              }}>{q}</button>
             ))}
           </div>
         )}
+      </div>
 
+      {/* Messages */}
+      <div style={{flex:1,overflowY:"auto",paddingBottom:8}}>
         {messages.map(msg=>(
-          <div key={msg.id} style={{marginBottom:12}}>
-            {msg.role==="user"?(
-              <div style={{display:"flex",justifyContent:"flex-end"}}>
-                <div style={{maxWidth:"82%",background:modeColor+"20",border:`1px solid ${modeColor}30`,borderRadius:"14px 14px 4px 14px",padding:"10px 14px",fontSize:14,color:C.text,lineHeight:1.5}}>
-                  {msg.content}
-                </div>
-              </div>
-            ):(
-              <div style={{display:"flex",gap:8,alignItems:"flex-start"}}>
-                <div style={{width:26,height:26,borderRadius:"50%",background:modeColor+"25",border:`1px solid ${modeColor}40`,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,marginTop:2}}>
-                  <Ic n="spark" s={13} c={modeColor}/>
-                </div>
-                <div style={{flex:1,background:C.card,border:`1px solid ${C.border}`,borderRadius:"4px 14px 14px 14px",padding:"10px 14px",fontSize:14,color:C.text,lineHeight:1.6,whiteSpace:"pre-wrap"}}>
-                  {msg.content}
-                </div>
-              </div>
-            )}
+          <div key={msg.id} style={{
+            display:"flex",gap:8,alignItems:"flex-start",marginBottom:12,
+            flexDirection:msg.role==="user"?"row-reverse":"row"
+          }}>
+            <div style={{
+              width:26,height:26,borderRadius:"50%",flexShrink:0,marginTop:2,
+              background:msg.role==="user"?modeColor+"25":C.card,
+              border:`1px solid ${msg.role==="user"?modeColor+"40":C.border}`,
+              display:"flex",alignItems:"center",justifyContent:"center",
+              fontSize:11,fontWeight:700,color:msg.role==="user"?modeColor:C.muted
+            }}>
+              {msg.role==="user"?"You":"AI"}
+            </div>
+            <div style={{
+              flex:1,background:msg.role==="user"?modeColor+"14":C.card,
+              border:`1px solid ${msg.role==="user"?modeColor+"30":C.border}`,
+              borderRadius:msg.role==="user"?"14px 4px 14px 14px":"4px 14px 14px 14px",
+              padding:"10px 14px",fontSize:14,color:C.text,lineHeight:1.6,
+              whiteSpace:"pre-wrap"
+            }}>
+              {msg.content}
+            </div>
           </div>
         ))}
 
         {streaming&&(
           <div style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:12}}>
-            <div style={{width:26,height:26,borderRadius:"50%",background:modeColor+"25",border:`1px solid ${modeColor}40`,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,marginTop:2}}>
-              <Ic n="spark" s={13} c={modeColor}/>
-            </div>
+            <div style={{width:26,height:26,borderRadius:"50%",background:C.card,border:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,marginTop:2,fontSize:11,fontWeight:700,color:C.muted}}>AI</div>
             <div style={{flex:1,background:C.card,border:`1px solid ${C.border}`,borderRadius:"4px 14px 14px 14px",padding:"10px 14px",fontSize:14,color:C.text,lineHeight:1.6,whiteSpace:"pre-wrap"}}>
               {streamText||<span style={{color:C.muted}}><span className="live">●</span> Thinking...</span>}
             </div>
@@ -2060,7 +2162,7 @@ function AiScreen({ patients, lists }) {
             }
           </button>
         </div>
-        <div style={{fontSize:10,color:C.faint,marginTop:5,textAlign:"center"}}>Claude · For clinical support only · Always apply your own judgement</div>
+        <div style={{fontSize:10,color:C.faint,marginTop:5,textAlign:"center"}}>Google Gemini · Free tier · Always apply your own clinical judgement</div>
       </div>
     </div>
   );
